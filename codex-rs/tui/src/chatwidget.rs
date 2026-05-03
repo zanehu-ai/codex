@@ -345,6 +345,7 @@ mod reasoning_shortcuts;
 mod side;
 mod status_surfaces;
 use self::status_surfaces::CachedProjectRootName;
+pub(crate) use self::status_surfaces::StatusLineGitSummary;
 use self::status_surfaces::TerminalTitleStatusKind;
 mod user_messages;
 use self::user_messages::PendingSteerCompareKey;
@@ -1004,6 +1005,14 @@ pub(crate) struct ChatWidget {
     status_line_branch_pending: bool,
     // True once we've attempted a branch lookup for the current CWD.
     status_line_branch_lookup_complete: bool,
+    // Cached PR and branch-change summary for the active status-line cwd.
+    status_line_git_summary: Option<StatusLineGitSummary>,
+    // CWD used to resolve the cached Git summary; change resets summary state.
+    status_line_git_summary_cwd: Option<PathBuf>,
+    // True while an async Git summary lookup is in flight.
+    status_line_git_summary_pending: bool,
+    // True once we've attempted a Git summary lookup for the current CWD.
+    status_line_git_summary_lookup_complete: bool,
     // Current thread-goal status shown in the status line when plan mode is inactive.
     current_goal_status_indicator: Option<GoalStatusIndicator>,
     current_goal_status: Option<GoalStatusState>,
@@ -1929,6 +1938,22 @@ impl ChatWidget {
         self.refresh_status_surfaces();
     }
 
+    /// Stores async Git summary lookup results for the current status-line cwd.
+    pub(crate) fn set_status_line_git_summary(
+        &mut self,
+        cwd: PathBuf,
+        summary: StatusLineGitSummary,
+    ) {
+        if self.status_line_git_summary_cwd.as_ref() != Some(&cwd) {
+            self.status_line_git_summary_pending = false;
+            return;
+        }
+        self.status_line_git_summary = Some(summary);
+        self.status_line_git_summary_pending = false;
+        self.status_line_git_summary_lookup_complete = true;
+        self.refresh_status_surfaces();
+    }
+
     fn collect_runtime_metrics_delta(&mut self) {
         if let Some(delta) = self.session_telemetry.runtime_metrics_summary() {
             self.apply_runtime_metrics_delta(delta);
@@ -2499,6 +2524,7 @@ impl ChatWidget {
             self.needs_final_message_separator = false;
             self.had_work_activity = false;
             self.request_status_line_branch_refresh();
+            self.request_status_line_git_summary_refresh();
         }
         // Mark task stopped and request redraw now that all content is in history.
         self.pending_status_indicator_restore = false;
@@ -2960,6 +2986,7 @@ impl ChatWidget {
         self.plan_stream_controller = None;
         self.pending_status_indicator_restore = false;
         self.request_status_line_branch_refresh();
+        self.request_status_line_git_summary_refresh();
         self.maybe_show_pending_rate_limit_prompt();
     }
 
@@ -4973,6 +5000,10 @@ impl ChatWidget {
             status_line_branch_cwd: None,
             status_line_branch_pending: false,
             status_line_branch_lookup_complete: false,
+            status_line_git_summary: None,
+            status_line_git_summary_cwd: None,
+            status_line_git_summary_pending: false,
+            status_line_git_summary_lookup_complete: false,
             current_goal_status_indicator: None,
             current_goal_status: None,
             goal_status_active_turn_started_at: None,

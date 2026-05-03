@@ -6,6 +6,10 @@
 use super::*;
 use crate::bottom_pane::status_line_from_segments;
 use crate::status::format_tokens_compact;
+use codex_git_utils::GitBranchDiffStats;
+use codex_git_utils::branch_diff_stats_to_default_branch;
+use serde::Deserialize;
+use tokio::process::Command;
 
 /// Items shown in the terminal title when the user has not configured a
 /// custom selection. Intentionally minimal: activity indicator + project name.
@@ -59,6 +63,14 @@ impl StatusSurfaceSelections {
                 .terminal_title_items
                 .contains(&TerminalTitleItem::GitBranch)
     }
+
+    fn uses_git_summary(&self) -> bool {
+        self.status_line_items
+            .contains(&StatusLineItem::PullRequestNumber)
+            || self
+                .status_line_items
+                .contains(&StatusLineItem::BranchChanges)
+    }
 }
 
 /// Cached project-root display name keyed by the cwd used for the last lookup.
@@ -70,6 +82,12 @@ impl StatusSurfaceSelections {
 pub(super) struct CachedProjectRootName {
     pub(super) cwd: PathBuf,
     pub(super) root_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StatusLineGitSummary {
+    pub(crate) pull_request_number: Option<u64>,
+    pub(crate) branch_change_stats: Option<GitBranchDiffStats>,
 }
 
 impl ChatWidget {
@@ -132,13 +150,24 @@ impl ChatWidget {
             self.status_line_branch = None;
             self.status_line_branch_pending = false;
             self.status_line_branch_lookup_complete = false;
-            return;
+        } else {
+            let cwd = self.status_line_cwd().to_path_buf();
+            self.sync_status_line_branch_state(&cwd);
+            if !self.status_line_branch_lookup_complete {
+                self.request_status_line_branch(cwd);
+            }
         }
 
-        let cwd = self.status_line_cwd().to_path_buf();
-        self.sync_status_line_branch_state(&cwd);
-        if !self.status_line_branch_lookup_complete {
-            self.request_status_line_branch(cwd);
+        if !selections.uses_git_summary() {
+            self.status_line_git_summary = None;
+            self.status_line_git_summary_pending = false;
+            self.status_line_git_summary_lookup_complete = false;
+        } else {
+            let cwd = self.status_line_cwd().to_path_buf();
+            self.sync_status_line_git_summary_state(&cwd);
+            if !self.status_line_git_summary_lookup_complete {
+                self.request_status_line_git_summary(cwd);
+            }
         }
     }
 
@@ -348,6 +377,16 @@ impl ChatWidget {
         self.request_status_line_branch(cwd);
     }
 
+    pub(super) fn request_status_line_git_summary_refresh(&mut self) {
+        let selections = self.status_surface_selections();
+        if !selections.uses_git_summary() {
+            return;
+        }
+        let cwd = self.status_line_cwd().to_path_buf();
+        self.sync_status_line_git_summary_state(&cwd);
+        self.request_status_line_git_summary(cwd);
+    }
+
     /// Parses configured status-line ids into known items and collects unknown ids.
     ///
     /// Unknown ids are deduplicated in insertion order for warning messages.
@@ -473,6 +512,16 @@ impl ChatWidget {
         self.status_line_branch_lookup_complete = false;
     }
 
+    fn sync_status_line_git_summary_state(&mut self, cwd: &Path) {
+        if self.status_line_git_summary_cwd.as_deref() == Some(cwd) {
+            return;
+        }
+        self.status_line_git_summary_cwd = Some(cwd.to_path_buf());
+        self.status_line_git_summary = None;
+        self.status_line_git_summary_pending = false;
+        self.status_line_git_summary_lookup_complete = false;
+    }
+
     /// Starts an async git-branch lookup unless one is already running.
     ///
     /// The resulting `StatusLineBranchUpdated` event carries the lookup cwd so callers can reject
@@ -486,6 +535,18 @@ impl ChatWidget {
         tokio::spawn(async move {
             let branch = current_branch_name(&cwd).await;
             tx.send(AppEvent::StatusLineBranchUpdated { cwd, branch });
+        });
+    }
+
+    fn request_status_line_git_summary(&mut self, cwd: PathBuf) {
+        if self.status_line_git_summary_pending {
+            return;
+        }
+        self.status_line_git_summary_pending = true;
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let summary = status_line_git_summary(&cwd).await;
+            tx.send(AppEvent::StatusLineGitSummaryUpdated { cwd, summary });
         });
     }
 
@@ -506,6 +567,22 @@ impl ChatWidget {
             }
             StatusLineItem::ProjectRoot => self.status_line_project_root_name(),
             StatusLineItem::GitBranch => self.status_line_branch.clone(),
+            StatusLineItem::PullRequestNumber => self
+                .status_line_git_summary
+                .as_ref()
+                .and_then(|summary| summary.pull_request_number)
+                .map(|number| format!("PR #{number}")),
+            StatusLineItem::BranchChanges => self
+                .status_line_git_summary
+                .as_ref()
+                .and_then(|summary| summary.branch_change_stats.as_ref())
+                .map(|stats| {
+                    if stats.additions == 0 && stats.deletions == 0 {
+                        "No changes".to_string()
+                    } else {
+                        format!("+{} -{}", stats.additions, stats.deletions)
+                    }
+                }),
             StatusLineItem::Status => Some(self.run_state_status_text()),
             StatusLineItem::UsedTokens => {
                 let usage = self.status_line_total_usage();
@@ -585,6 +662,8 @@ impl ChatWidget {
             StatusSurfacePreviewItem::CurrentDir => StatusLineItem::CurrentDir,
             StatusSurfacePreviewItem::ThreadTitle => StatusLineItem::ThreadTitle,
             StatusSurfacePreviewItem::GitBranch => StatusLineItem::GitBranch,
+            StatusSurfacePreviewItem::PullRequestNumber => StatusLineItem::PullRequestNumber,
+            StatusSurfacePreviewItem::BranchChanges => StatusLineItem::BranchChanges,
             StatusSurfacePreviewItem::ContextRemaining => StatusLineItem::ContextRemaining,
             StatusSurfacePreviewItem::ContextUsed => StatusLineItem::ContextUsed,
             StatusSurfacePreviewItem::FiveHourLimit => StatusLineItem::FiveHourLimit,
@@ -794,6 +873,45 @@ impl ChatWidget {
         truncated.push_str("...");
         truncated
     }
+}
+
+#[derive(Deserialize)]
+struct GhPullRequestListItem {
+    number: u64,
+}
+
+async fn status_line_git_summary(cwd: &Path) -> StatusLineGitSummary {
+    let (pull_request_number, branch_change_stats) = tokio::join!(
+        open_pull_request_number(cwd),
+        branch_diff_stats_to_default_branch(cwd),
+    );
+    StatusLineGitSummary {
+        pull_request_number,
+        branch_change_stats,
+    }
+}
+
+async fn open_pull_request_number(cwd: &Path) -> Option<u64> {
+    let branch = current_branch_name(cwd).await?;
+    let output = Command::new("gh")
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "pr", "list", "--head", &branch, "--state", "open", "--json", "number", "--limit", "1",
+        ])
+        .current_dir(cwd)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice::<Vec<GhPullRequestListItem>>(&output.stdout)
+        .ok()?
+        .into_iter()
+        .next()
+        .map(|pr| pr.number)
 }
 
 fn parse_items_with_invalids<T>(ids: impl IntoIterator<Item = String>) -> (Vec<T>, Vec<String>)

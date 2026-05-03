@@ -60,6 +60,12 @@ pub struct GitDiffToRemote {
     pub diff: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitBranchDiffStats {
+    pub additions: u64,
+    pub deletions: u64,
+}
+
 /// Collect git repository information from the given working directory using command-line git.
 /// Returns None if no git repository is found or if git operations fail.
 /// Uses timeouts to prevent freezing on large repositories.
@@ -265,6 +271,48 @@ pub async fn git_diff_to_remote(cwd: &Path) -> Option<GitDiffToRemote> {
     Some(GitDiffToRemote {
         sha: base_sha,
         diff,
+    })
+}
+
+/// Returns committed branch diff stats relative to the repository's default branch.
+pub async fn branch_diff_stats_to_default_branch(cwd: &Path) -> Option<GitBranchDiffStats> {
+    get_git_repo_root(cwd)?;
+    let default_branch = default_branch_name(cwd).await?;
+    let merge_base =
+        run_git_command_with_timeout(&["merge-base", "HEAD", &default_branch], cwd).await?;
+    if !merge_base.status.success() {
+        return None;
+    }
+    let merge_base = String::from_utf8(merge_base.stdout).ok()?;
+    let merge_base = merge_base.trim();
+    if merge_base.is_empty() {
+        return None;
+    }
+
+    let range = format!("{merge_base}..HEAD");
+    let numstat = run_git_command_with_timeout(&["diff", "--numstat", &range], cwd).await?;
+    if !numstat.status.success() {
+        return None;
+    }
+    let numstat = String::from_utf8(numstat.stdout).ok()?;
+
+    let mut additions = 0_u64;
+    let mut deletions = 0_u64;
+    for line in numstat.lines() {
+        let mut columns = line.split('\t');
+        additions += columns
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        deletions += columns
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+    }
+
+    Some(GitBranchDiffStats {
+        additions,
+        deletions,
     })
 }
 

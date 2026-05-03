@@ -1,6 +1,7 @@
 use codex_exec_server::LOCAL_FS;
 use codex_git_utils::GitInfo;
 use codex_git_utils::GitSha;
+use codex_git_utils::branch_diff_stats_to_default_branch;
 use codex_git_utils::collect_git_info;
 use codex_git_utils::get_has_changes;
 use codex_git_utils::git_diff_to_remote;
@@ -428,6 +429,63 @@ async fn test_get_git_working_tree_state_branch_fallback() {
         .await
         .expect("Should collect working tree state");
     assert_eq!(state.sha, GitSha::new(&remote_sha));
+}
+
+#[tokio::test]
+async fn branch_diff_stats_to_default_branch_reports_clean_branch() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let repo_path = create_test_git_repo(&temp_dir).await;
+    Command::new("git")
+        .args(["branch", "-M", "main"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("Failed to rename default branch");
+
+    let stats = branch_diff_stats_to_default_branch(&repo_path)
+        .await
+        .expect("Should collect branch diff stats");
+    assert_eq!(stats.additions, 0);
+    assert_eq!(stats.deletions, 0);
+}
+
+#[tokio::test]
+async fn branch_diff_stats_to_default_branch_counts_committed_branch_changes() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let repo_path = create_test_git_repo(&temp_dir).await;
+    Command::new("git")
+        .args(["branch", "-M", "main"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("Failed to rename default branch");
+
+    Command::new("git")
+        .args(["checkout", "-b", "feature"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("Failed to create feature branch");
+    fs::write(repo_path.join("test.txt"), "line 1\nline 2\n").expect("write updated file");
+    fs::write(repo_path.join("new.txt"), "new\n").expect("write new file");
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("Failed to stage branch changes");
+    Command::new("git")
+        .args(["commit", "-m", "feature changes"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("Failed to commit branch changes");
+
+    let stats = branch_diff_stats_to_default_branch(&repo_path)
+        .await
+        .expect("Should collect branch diff stats");
+    assert_eq!(stats.additions, 3);
+    assert_eq!(stats.deletions, 1);
 }
 
 #[tokio::test]

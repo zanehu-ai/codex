@@ -32,7 +32,9 @@ impl StatusLineAccent {
         match item {
             StatusLineItem::ModelName | StatusLineItem::ModelWithReasoning => Self::Model,
             StatusLineItem::CurrentDir | StatusLineItem::ProjectRoot => Self::Path,
-            StatusLineItem::GitBranch => Self::Branch,
+            StatusLineItem::GitBranch
+            | StatusLineItem::PullRequestNumber
+            | StatusLineItem::BranchChanges => Self::Branch,
             StatusLineItem::Status => Self::State,
             StatusLineItem::ContextRemaining
             | StatusLineItem::ContextUsed

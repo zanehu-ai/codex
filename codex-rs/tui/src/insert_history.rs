@@ -38,19 +38,20 @@ use ratatui::text::Span;
 /// Selects the terminal escape strategy for inserting history lines above the viewport.
 ///
 /// Standard terminals support `DECSTBM` scroll regions and Reverse Index (`ESC M`),
-/// which let us slide existing content down without redrawing it. Zellij silently
-/// drops or mishandles those sequences, so `Zellij` mode falls back to emitting
-/// newlines at the bottom of the screen and writing lines at absolute positions.
+/// which let us slide existing content down without redrawing it. Some terminals
+/// or terminal-like surfaces mishandle those sequences for normal scrollback, so
+/// `Newline` mode falls back to emitting newlines at the bottom of the screen
+/// and writing lines at absolute positions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertHistoryMode {
     Standard,
-    Zellij,
+    Newline,
 }
 
 impl InsertHistoryMode {
-    pub fn new(is_zellij: bool) -> Self {
-        if is_zellij {
-            Self::Zellij
+    pub fn new(use_newline_insert: bool) -> Self {
+        if use_newline_insert {
+            Self::Newline
         } else {
             Self::Standard
         }
@@ -72,12 +73,11 @@ where
 /// Insert `lines` above the viewport, using the escape strategy selected by `mode`.
 ///
 /// In `Standard` mode this manipulates DECSTBM scroll regions to slide existing
-/// scrollback down and writes new lines into the freed space. In `Zellij` mode it
-/// emits newlines at the screen bottom to create space (since Zellij ignores scroll
-/// region escapes) and writes lines at computed absolute positions. Both modes
-/// update `terminal.viewport_area` so subsequent draw passes know where the
-/// viewport moved to. Resize reflow uses the same viewport-aware path after
-/// clearing old scrollback.
+/// scrollback down and writes new lines into the freed space. In `Newline` mode
+/// it emits newlines at the screen bottom to create space and writes lines at
+/// computed absolute positions. Both modes update `terminal.viewport_area` so
+/// subsequent draw passes know where the viewport moved to. Resize reflow uses
+/// the same viewport-aware path after clearing old scrollback.
 pub fn insert_history_lines_with_mode<B>(
     terminal: &mut crate::custom_terminal::Terminal<B>,
     lines: Vec<Line>,
@@ -97,35 +97,54 @@ where
     let (wrapped, wrapped_lines) = wrap_history_lines(&lines, wrap_width);
 
     match mode {
-        InsertHistoryMode::Zellij => {
-            let space_below = screen_size.height.saturating_sub(area.bottom());
-            let shift_down = wrapped_lines.min(space_below);
-            let scroll_up_amount = wrapped_lines.saturating_sub(shift_down);
+        InsertHistoryMode::Newline => {
+            let screen_height = screen_size.height;
+            if screen_height > 0 && wrapped_lines > 0 {
+                let viewport_height = area.height.min(screen_height);
+                let mut next_line = 0usize;
+                let mut remaining_rows = wrapped_lines;
+                let mut drawn_height = area.top().min(screen_height);
 
-            if scroll_up_amount > 0 {
-                // Scroll the entire screen up by emitting \n at the bottom
-                queue!(
-                    writer,
-                    MoveTo(/*x*/ 0, screen_size.height.saturating_sub(1))
-                )?;
-                for _ in 0..scroll_up_amount {
-                    queue!(writer, Print("\n"))?;
+                while next_line < wrapped.len()
+                    && remaining_rows.saturating_add(viewport_height) > screen_height
+                {
+                    let target_rows = remaining_rows.min(screen_height);
+                    let (chunk_len, chunk_rows) =
+                        history_chunk_by_rows(&wrapped[next_line..], wrap_width, target_rows);
+                    let scroll_up_amount = drawn_height
+                        .saturating_add(chunk_rows)
+                        .saturating_sub(screen_height);
+                    scroll_screen_up_with_newlines(writer, screen_height, scroll_up_amount)?;
+                    let y = drawn_height.saturating_sub(scroll_up_amount);
+                    write_history_lines_at(
+                        writer,
+                        &wrapped[next_line..next_line + chunk_len],
+                        wrap_width,
+                        y,
+                    )?;
+                    next_line += chunk_len;
+                    remaining_rows = remaining_rows.saturating_sub(chunk_rows);
+                    drawn_height = drawn_height
+                        .saturating_add(chunk_rows)
+                        .saturating_sub(scroll_up_amount);
                 }
-            }
 
-            if shift_down > 0 {
-                area.y += shift_down;
+                if next_line < wrapped.len() {
+                    let final_rows = remaining_rows;
+                    let scroll_up_amount = drawn_height
+                        .saturating_add(final_rows)
+                        .saturating_add(viewport_height)
+                        .saturating_sub(screen_height);
+                    scroll_screen_up_with_newlines(writer, screen_height, scroll_up_amount)?;
+                    let y = drawn_height.saturating_sub(scroll_up_amount);
+                    write_history_lines_at(writer, &wrapped[next_line..], wrap_width, y)?;
+                    drawn_height = drawn_height
+                        .saturating_add(final_rows)
+                        .saturating_sub(scroll_up_amount);
+                }
+
+                area.y = drawn_height;
                 should_update_area = true;
-            }
-
-            let cursor_top = area.top().saturating_sub(scroll_up_amount + shift_down);
-            queue!(writer, MoveTo(/*x*/ 0, cursor_top))?;
-
-            for (i, line) in wrapped.iter().enumerate() {
-                if i > 0 {
-                    queue!(writer, Print("\r\n"))?;
-                }
-                write_history_line(writer, line, wrap_width)?;
             }
         }
         InsertHistoryMode::Standard => {
@@ -260,6 +279,57 @@ fn wrap_history_lines<'a>(lines: &'a [Line<'a>], wrap_width: usize) -> (Vec<Line
     }
 
     (wrapped, wrapped_rows as u16)
+}
+
+fn history_chunk_by_rows(lines: &[Line<'_>], wrap_width: usize, max_rows: u16) -> (usize, u16) {
+    let mut rows = 0u16;
+    for (index, line) in lines.iter().enumerate() {
+        let line_rows = history_line_rows(line, wrap_width);
+        if index > 0 && rows.saturating_add(line_rows) > max_rows {
+            break;
+        }
+        rows = rows.saturating_add(line_rows);
+        if rows >= max_rows {
+            return (index + 1, rows);
+        }
+    }
+
+    (lines.len(), rows)
+}
+
+fn scroll_screen_up_with_newlines<W: Write>(
+    writer: &mut W,
+    screen_height: u16,
+    rows: u16,
+) -> io::Result<()> {
+    if rows == 0 {
+        return Ok(());
+    }
+
+    queue!(writer, MoveTo(/*x*/ 0, screen_height.saturating_sub(1)))?;
+    for _ in 0..rows {
+        queue!(writer, Print("\n"))?;
+    }
+    Ok(())
+}
+
+fn write_history_lines_at<W: Write>(
+    writer: &mut W,
+    lines: &[Line<'_>],
+    wrap_width: usize,
+    mut y: u16,
+) -> io::Result<()> {
+    for line in lines {
+        queue!(writer, MoveTo(/*x*/ 0, y))?;
+        write_history_line(writer, line, wrap_width)?;
+        y = y.saturating_add(history_line_rows(line, wrap_width));
+    }
+
+    Ok(())
+}
+
+fn history_line_rows(line: &Line<'_>, wrap_width: usize) -> u16 {
+    line.width().max(1).div_ceil(wrap_width) as u16
 }
 
 fn is_preformatted_box_table_line(line: &Line<'_>) -> bool {
@@ -885,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn vt100_zellij_mode_inserts_history_and_updates_viewport() {
+    fn vt100_newline_mode_inserts_history_and_updates_viewport() {
         let width: u16 = 32;
         let height: u16 = 8;
         let backend = VT100Backend::new(width, height);
@@ -894,7 +964,7 @@ mod tests {
         term.set_viewport_area(viewport);
 
         let line: Line<'static> = Line::from("zellij history");
-        insert_history_lines_with_mode(&mut term, vec![line], InsertHistoryMode::Zellij)
+        insert_history_lines_with_mode(&mut term, vec![line], InsertHistoryMode::Newline)
             .expect("insert zellij history");
 
         let start_row = 0;
@@ -910,6 +980,68 @@ mod tests {
         );
         assert_eq!(term.viewport_area, Rect::new(0, 5, width, 2));
         assert_eq!(term.visible_history_rows(), 1);
+    }
+
+    #[test]
+    fn vt100_newline_mode_keeps_large_insert_tail_above_viewport() {
+        let width: u16 = 48;
+        let height: u16 = 12;
+        let viewport_height: u16 = 2;
+        let backend = VT100Backend::new_with_scrollback(width, height, /*scrollback_len*/ 128);
+        let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+        let viewport = Rect::new(
+            /*x*/ 0,
+            height - viewport_height,
+            width,
+            viewport_height,
+        );
+        term.set_viewport_area(viewport);
+
+        let lines = (1..=18)
+            .map(|index| Line::from(format!("history row {index:02}")))
+            .collect();
+        insert_history_lines_with_mode(&mut term, lines, InsertHistoryMode::Newline)
+            .expect("insert large newline-mode history");
+
+        // A normal draw immediately repaints the inline viewport after history insertion.
+        // The inserted history tail must remain above that viewport rather than being
+        // written into rows that the draw will clear.
+        let viewport = term.viewport_area;
+        {
+            let writer = term.backend_mut();
+            for y in viewport.top()..viewport.bottom() {
+                queue!(writer, MoveTo(/*x*/ 0, y), Clear(ClearType::UntilNewLine))
+                    .expect("clear viewport row");
+            }
+        }
+
+        let rows: Vec<String> = term
+            .backend()
+            .vt100()
+            .screen()
+            .rows(/*start*/ 0, width)
+            .collect();
+        let tail = rows[..viewport.top() as usize].join("\n");
+        assert!(
+            tail.contains("history row 18"),
+            "expected final inserted row above viewport, rows={rows:?}, viewport={viewport:?}",
+        );
+
+        term.backend_mut()
+            .vt100_mut()
+            .screen_mut()
+            .set_scrollback(usize::MAX);
+        let scrolled_rows: Vec<String> = term
+            .backend()
+            .vt100()
+            .screen()
+            .rows(/*start*/ 0, width)
+            .collect();
+        let scrolled = scrolled_rows.join("\n");
+        assert!(
+            scrolled.contains("history row 01"),
+            "expected oldest inserted rows in terminal scrollback, rows={scrolled_rows:?}",
+        );
     }
 
     #[test]

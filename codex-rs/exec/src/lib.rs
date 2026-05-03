@@ -10,6 +10,7 @@ mod event_processor_with_human_output;
 pub(crate) mod event_processor_with_jsonl_output;
 pub(crate) mod exec_events;
 
+use anyhow::Context;
 pub use cli::Cli;
 pub use cli::Command;
 pub use cli::ReviewArgs;
@@ -69,6 +70,7 @@ use codex_core::format_exec_policy_error_with_source;
 use codex_core::path_utils;
 use codex_feedback::CodexFeedback;
 use codex_git_utils::get_git_repo_root;
+use codex_git_utils::prepare_codex_worktree;
 use codex_login::AuthConfig;
 use codex_login::default_client::set_default_client_residency_requirement;
 use codex_login::default_client::set_default_originator;
@@ -253,6 +255,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         sandbox_mode: sandbox_mode_cli_arg,
         dangerously_bypass_approvals_and_sandbox,
         cwd,
+        worktree,
         add_dir,
     } = shared;
 
@@ -295,14 +298,6 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         }
     };
 
-    let resolved_cwd = cwd.clone();
-    let config_cwd = match resolved_cwd.as_deref() {
-        Some(path) => {
-            AbsolutePathBuf::from_absolute_path(canonicalize_existing_preserving_symlinks(path)?)?
-        }
-        None => AbsolutePathBuf::current_dir()?,
-    };
-
     // we load config.toml here to determine project state.
     #[allow(clippy::print_stderr)]
     let codex_home = match find_codex_home() {
@@ -311,6 +306,21 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             eprintln!("Error finding codex home: {err}");
             std::process::exit(1);
         }
+    };
+
+    let resolved_cwd = if worktree {
+        Some(
+            prepare_codex_worktree(&codex_home, cwd.as_deref())
+                .context("failed to prepare Codex worktree")?,
+        )
+    } else {
+        cwd.clone()
+    };
+    let config_cwd = match resolved_cwd.as_deref() {
+        Some(path) => {
+            AbsolutePathBuf::from_absolute_path(canonicalize_existing_preserving_symlinks(path)?)?
+        }
+        None => AbsolutePathBuf::current_dir()?,
     };
 
     #[allow(clippy::print_stderr)]

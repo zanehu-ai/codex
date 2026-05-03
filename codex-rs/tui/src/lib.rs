@@ -42,6 +42,7 @@ use codex_config::format_config_error_with_source;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::EnvironmentManagerArgs;
 use codex_exec_server::ExecServerRuntimePaths;
+use codex_git_utils::prepare_codex_worktree;
 use codex_login::AuthConfig;
 use codex_login::default_client::set_default_client_residency_requirement;
 use codex_login::enforce_login_restrictions;
@@ -700,6 +701,11 @@ pub async fn run_main(
             auth_token: remote_auth_token.clone(),
         })
         .unwrap_or(AppServerTarget::Embedded);
+    if cli.worktree && matches!(app_server_target, AppServerTarget::Remote { .. }) {
+        return Err(std::io::Error::other(
+            "--worktree cannot be used with --remote",
+        ));
+    }
     let remote_cwd_override = cli
         .cwd
         .clone()
@@ -747,6 +753,12 @@ pub async fn run_main(
             std::process::exit(1);
         }
     };
+
+    if cli.worktree {
+        let worktree_cwd = prepare_codex_worktree(codex_home.as_path(), cli.cwd.as_deref())
+            .map_err(std::io::Error::other)?;
+        cli.cwd = Some(worktree_cwd);
+    }
 
     let environment_manager = Arc::new(
         EnvironmentManager::new(EnvironmentManagerArgs::new(

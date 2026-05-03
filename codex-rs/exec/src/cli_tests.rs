@@ -72,6 +72,14 @@ fn parses_config_isolation_flags() {
 }
 
 #[test]
+fn worktree_without_name_preserves_prompt_position() {
+    let cli = Cli::parse_from(["codex-exec", "--worktree", "summarize"]);
+
+    assert!(cli.worktree);
+    assert_eq!(cli.prompt.as_deref(), Some("summarize"));
+}
+
+#[test]
 fn removed_full_auto_flag_reports_migration_path() {
     let cli = Cli::parse_from(["codex-exec", "--full-auto", "summarize"]);
 
